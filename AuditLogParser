@@ -1,0 +1,59 @@
+import os
+import pandas as pd
+import json
+
+# Enter the path to the spreadsheet
+spreadsheet = input("Enter the path to your spreadsheet: ")
+
+# Determine the file extension
+file_extension = spreadsheet.split('.')[-1]
+
+# Read the Excel file or CSV file based on the file extension
+if file_extension == 'xlsx':
+    df = pd.read_excel(spreadsheet)
+elif file_extension == 'csv':
+    df = pd.read_csv(spreadsheet)
+else:
+    raise ValueError("Invalid file format. Only XLSX and CSV files are supported.")
+
+# Enter the column name you wish to read
+column_name = 'AuditData'
+
+# Access the column of JSON data
+json_data_column = df[column_name]
+
+# Convert JSON data in each cell
+parsed_data = []
+for json_cell_value in json_data_column:
+    if pd.notnull(json_cell_value):  # Check for non-null values
+        data = json.loads(json_cell_value)
+        parsed_data.append(data)
+
+# Convert parsed data to DataFrame
+json_df = pd.json_normalize(parsed_data)
+
+# Add JSON data as new columns in the original DataFrame
+df = pd.concat([df, json_df], axis=1)
+
+# Drop the 'AuditData' column from the DataFrame
+df = df.drop(column_name, axis=1)
+
+# Extract the original file name without extension
+original_filename = os.path.splitext(os.path.basename(spreadsheet))[0]
+
+# Create the output directory if it doesn't exist
+output_dir = os.path.expanduser("~/Documents/ParsedAuditData")
+os.makedirs(output_dir, exist_ok=True)
+
+# Construct the output file path
+output_filename = f"{original_filename}_AuditDataParsed.csv"
+output_file = os.path.join(output_dir, output_filename)
+
+# Export the updated DataFrame to the output file
+df.to_csv(output_file, index=False)
+
+print("Data export completed successfully!")
+print(f"Output file saved at: {output_file}")
+
+# Prompt for user input to prevent the window from closing
+input("Press Enter to exit...")
