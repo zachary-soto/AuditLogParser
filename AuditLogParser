@@ -1,59 +1,166 @@
 import os
-import pandas as pd
 import json
+import hashlib
+import datetime
+import threading
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from tkinter.scrolledtext import ScrolledText
+from openpyxl.styles import PatternFill
+from openpyxl import load_workbook
 
-# Enter the path to the spreadsheet
-spreadsheet = input("Enter the path to your spreadsheet: ")
+__version__ = "1.0.0"
+LARGE_FILE_THRESHOLD_MB = 200  # Warn if larger than this
 
-# Determine the file extension
-file_extension = spreadsheet.split('.')[-1]
+# -------------------- Utility Functions --------------------
+def compute_sha256(file_path):
+    sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for block in iter(lambda: f.read(65536), b""):
+            sha256.update(block)
+    return sha256.hexdigest()
 
-# Read the Excel file or CSV file based on the file extension
-if file_extension == 'xlsx':
-    df = pd.read_excel(spreadsheet)
-elif file_extension == 'csv':
-    df = pd.read_csv(spreadsheet)
-else:
-    raise ValueError("Invalid file format. Only XLSX and CSV files are supported.")
+def init_log_file(output_path):
+    base = os.path.splitext(output_path)[0]
+    return base + ".log"
 
-# Enter the column name you wish to read
-column_name = 'AuditData'
+def log(message):
+    timestamp = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ")
+    full_message = timestamp + message
+    console.insert(tk.END, full_message + "\n")
+    console.see(tk.END)
+    app.update_idletasks()
 
-# Access the column of JSON data
-json_data_column = df[column_name]
+    log_path = log_file_path.get()
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(full_message + "\n")
 
-# Convert JSON data in each cell
-parsed_data = []
-for json_cell_value in json_data_column:
-    if pd.notnull(json_cell_value):  # Check for non-null values
-        data = json.loads(json_cell_value)
-        parsed_data.append(data)
+def update_progress(percent):
+    progress_bar['value'] = percent
+    app.update_idletasks()
 
-# Convert parsed data to DataFrame
-json_df = pd.json_normalize(parsed_data)
+def update_phase_progress(percent):
+    phase_bar['value'] = percent
+    app.update_idletasks()
 
-# Add JSON data as new columns in the original DataFrame
-df = pd.concat([df, json_df], axis=1)
+# -------------------- File Processing Logic --------------------
+def process_file(filepath, output_path, log_fn, progress_fn):
+    try:
+        start_time = datetime.datetime.now()
+        log_fn(f"🕒 Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        start_time_label.config(text=f"Start: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-# Drop the 'AuditData' column from the DataFrame
-df = df.drop(column_name, axis=1)
+        current_task.set("Reading input file...")
+        update_phase_progress(30)
+        ext = os.path.splitext(filepath)[-1].lower()
+        if ext == '.xlsx':
+            log_fn("Reading Excel file...")
+            df = pd.read_excel(filepath)
+        elif ext == '.csv':
+            log_fn("Reading CSV file...")
+            df = pd.read_csv(filepath)
+        else:
+            raise ValueError("Unsupported file type. Only .xlsx and .csv are supported.")
+        progress_fn(5)
 
-# Extract the original file name without extension
-original_filename = os.path.splitext(os.path.basename(spreadsheet))[0]
+        if 'AuditData' not in df.columns:
+            raise KeyError("Column 'AuditData' not found in file.")
 
-# Create the output directory if it doesn't exist
-output_dir = os.path.expanduser("~/Documents/ParsedAuditData")
-os.makedirs(output_dir, exist_ok=True)
+        current_task.set("Parsing AuditData...")
+        log_fn("Parsing AuditData JSON...")
+        parsed_data = []
+        total = len(df)
 
-# Construct the output file path
-output_filename = f"{original_filename}_AuditDataParsed.csv"
-output_file = os.path.join(output_dir, output_filename)
+        for idx, cell in enumerate(df['AuditData']):
+            if cancel_flag.get():
+                current_task.set("Cancelled.")
+                log_fn("❌ Cancelled by user.")
+                return None
 
-# Export the updated DataFrame to the output file
-df.to_csv(output_file, index=False)
+            if pd.notnull(cell):
+                try:
+                    parsed = json.loads(cell)
+                    parsed_data.append(parsed)
+                except json.JSONDecodeError:
+                    parsed_data.append({})
+                    log_fn(f"⚠️  Row {idx+1}: Invalid JSON. Skipping.")
+            else:
+                parsed_data.append({})
 
-print("Data export completed successfully!")
-print(f"Output file saved at: {output_file}")
+            if idx % 100 == 0 or idx == total - 1:
+                parse_progress = int((idx + 1) / total * 65)
+                progress_fn(5 + parse_progress)
+                update_phase_progress(int((idx + 1) / total * 100))
 
-# Prompt for user input to prevent the window from closing
-input("Press Enter to exit...")
+        current_task.set("Flattening JSON data...")
+        update_phase_progress(50)
+        log_fn("Flattening JSON and combining with original data...")
+        json_df = pd.json_normalize(parsed_data)
+        new_columns = json_df.columns.tolist()
+        df = df.drop(columns=['AuditData'])
+        df_combined = pd.concat([df, json_df], axis=1)
+        progress_fn(75)
+
+        current_task.set("Writing Excel file...")
+        update_phase_progress(80)
+        log_fn(f"Writing Excel file to {output_path}...")
+        df_combined.to_excel(output_path, index=False)
+        progress_fn(85)
+
+        current_task.set("Styling Excel headers...")
+        update_phase_progress(90)
+        log_fn("Styling new JSON headers...")
+        wb = load_workbook(output_path)
+        ws = wb.active
+        yellow_fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+
+        for col_idx, cell in enumerate(ws[1], start=1):
+            if cell.value in new_columns:
+                ws.cell(row=1, column=col_idx).fill = yellow_fill
+
+        progress_fn(95)
+        wb.save(output_path)
+
+        end_time = datetime.datetime.now()
+        duration = end_time - start_time
+        log_fn(f"🕔 Finish time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        log_fn(f"⏱ Duration: {str(duration)}")
+        finish_time_label.config(text=f"Finish: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        duration_label.config(text=f"Duration: {str(duration)}")
+
+        current_task.set("Done.")
+        log_fn("✅ Export and styling complete!")
+        progress_fn(100)
+        update_phase_progress(100)
+        return output_path
+
+    except Exception as e:
+        raise e
+
+# -------------------- Build GUI --------------------
+app = tk.Tk()
+app.title(f"AuditData Parser v{__version__}")
+app.geometry("600x580")
+app.resizable(False, False)
+
+input_file = tk.StringVar()
+output_file = tk.StringVar()
+log_file_path = tk.StringVar()
+cancel_flag = tk.BooleanVar(value=False)
+current_task = tk.StringVar(value="Idle")
+
+start_time_label = tk.Label(app, text="Start: --")
+finish_time_label = tk.Label(app, text="Finish: --")
+duration_label = tk.Label(app, text="Duration: --")
+
+# These will be placed at the bottom
+...
+
+start_time_label.pack()
+finish_time_label.pack()
+duration_label.pack()
+
+app.mainloop()
+
