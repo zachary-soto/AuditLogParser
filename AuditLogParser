@@ -1,166 +1,243 @@
 import os
-import json
 import hashlib
-import datetime
-import threading
 import pandas as pd
+import json
+import multiprocessing
+import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from tkinter.scrolledtext import ScrolledText
-from openpyxl.styles import PatternFill
-from openpyxl import load_workbook
+from tkinter import filedialog, ttk, messagebox
+from datetime import datetime
 
-__version__ = "1.0.0"
-LARGE_FILE_THRESHOLD_MB = 200  # Warn if larger than this
-
-# -------------------- Utility Functions --------------------
-def compute_sha256(file_path):
-    sha256 = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        for block in iter(lambda: f.read(65536), b""):
-            sha256.update(block)
-    return sha256.hexdigest()
-
-def init_log_file(output_path):
-    base = os.path.splitext(output_path)[0]
-    return base + ".log"
-
-def log(message):
-    timestamp = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ")
-    full_message = timestamp + message
-    console.insert(tk.END, full_message + "\n")
-    console.see(tk.END)
-    app.update_idletasks()
-
-    log_path = log_file_path.get()
-    if log_path:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(full_message + "\n")
-
-def update_progress(percent):
-    progress_bar['value'] = percent
-    app.update_idletasks()
-
-def update_phase_progress(percent):
-    phase_bar['value'] = percent
-    app.update_idletasks()
-
-# -------------------- File Processing Logic --------------------
-def process_file(filepath, output_path, log_fn, progress_fn):
+def safe_json_parse(cell):
     try:
-        start_time = datetime.datetime.now()
-        log_fn(f"🕒 Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        start_time_label.config(text=f"Start: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        return json.loads(cell) if cell else {}
+    except Exception:
+        return None  # Return None for invalid JSON to count errors later
 
-        current_task.set("Reading input file...")
-        update_phase_progress(30)
-        ext = os.path.splitext(filepath)[-1].lower()
-        if ext == '.xlsx':
-            log_fn("Reading Excel file...")
-            df = pd.read_excel(filepath)
-        elif ext == '.csv':
-            log_fn("Reading CSV file...")
-            df = pd.read_csv(filepath)
-        else:
-            raise ValueError("Unsupported file type. Only .xlsx and .csv are supported.")
-        progress_fn(5)
+class AuditDataParserApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("AuditData Parser v1.1.0")
+        self.root.geometry("700x550")
+        self.cancel_requested = False
+        self.log_file = None
 
-        if 'AuditData' not in df.columns:
-            raise KeyError("Column 'AuditData' not found in file.")
+        self.create_widgets()
+        self.log("AuditData Parser v1.1.0 ready.", "INFO")
 
-        current_task.set("Parsing AuditData...")
-        log_fn("Parsing AuditData JSON...")
-        parsed_data = []
-        total = len(df)
+    def create_widgets(self):
+        self.input_path = tk.StringVar()
+        self.output_path = tk.StringVar()
 
-        for idx, cell in enumerate(df['AuditData']):
-            if cancel_flag.get():
-                current_task.set("Cancelled.")
-                log_fn("❌ Cancelled by user.")
-                return None
+        ttk.Label(self.root, text="Input File:").pack(anchor="w", padx=10, pady=(10, 0))
+        ttk.Entry(self.root, textvariable=self.input_path, width=80).pack(padx=10)
+        ttk.Button(self.root, text="Browse File", command=self.browse_input).pack(padx=10, pady=(0, 10))
 
-            if pd.notnull(cell):
-                try:
-                    parsed = json.loads(cell)
-                    parsed_data.append(parsed)
-                except json.JSONDecodeError:
-                    parsed_data.append({})
-                    log_fn(f"⚠️  Row {idx+1}: Invalid JSON. Skipping.")
+        ttk.Label(self.root, text="Output File:").pack(anchor="w", padx=10)
+        ttk.Entry(self.root, textvariable=self.output_path, width=80).pack(padx=10)
+        ttk.Button(self.root, text="Save As", command=self.save_output).pack(padx=10, pady=(0, 10))
+
+        btn_frame = tk.Frame(self.root)
+        btn_frame.pack(pady=(0, 10))
+        tk.Button(btn_frame, text="Parse and Export", bg="lightgreen", command=self.start_threaded_processing).pack(side="left", padx=10)
+        tk.Button(btn_frame, text="Cancel", bg="lightcoral", command=self.cancel).pack(side="left", padx=10)
+
+        ttk.Label(self.root, text="Overall Progress:").pack(anchor="w", padx=10)
+        self.overall_progress = ttk.Progressbar(self.root, maximum=100)
+        self.overall_progress.pack(fill="x", padx=10, pady=(0, 10))
+
+        self.phase_label = ttk.Label(self.root, text="")
+        self.phase_label.pack(anchor="w", padx=10, pady=(5, 10))
+
+        # Time labels side-by-side in a frame
+        time_frame = tk.Frame(self.root)
+        time_frame.pack(anchor="w", padx=10, pady=(0,10), fill='x')
+
+        self.start_label = ttk.Label(time_frame, text="Start Time: N/A")
+        self.start_label.pack(side="left", padx=(0,20))
+
+        self.end_label = ttk.Label(time_frame, text="End Time: N/A")
+        self.end_label.pack(side="left", padx=(0,20))
+
+        self.duration_label = ttk.Label(time_frame, text="Duration: N/A")
+        self.duration_label.pack(side="left")
+
+        self.summary_label = ttk.Label(self.root, text="")
+        self.summary_label.pack(anchor="w", padx=10, pady=(0, 10))
+
+        self.log_box = tk.Text(self.root, height=12)
+        self.log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.log_box.tag_config("info", foreground="black")
+        self.log_box.tag_config("warn", foreground="orange")
+        self.log_box.tag_config("error", foreground="red")
+        self.log_box.tag_config("done", foreground="green")
+
+    def log(self, message, level="INFO"):
+        timestamp = datetime.now().strftime("[%H:%M:%S]")
+        icon = {"INFO": "ℹ️", "WARN": "⚠️", "ERROR": "❌", "DONE": "✅"}.get(level, "")
+        prefix = f"{icon} [{level}]"
+        full_message = f"{timestamp} {prefix} {message}\n"
+        tag = level.lower()
+
+        self.log_box.insert("end", full_message, tag)
+        self.log_box.see("end")
+
+        if self.log_file:
+            try:
+                with open(self.log_file, "a", encoding="utf-8") as f:
+                    f.write(full_message)
+            except Exception as e:
+                # Log file write error - only to GUI log box to avoid recursion
+                self.log_box.insert("end", f"[ERROR] Failed to write log file: {e}\n", "error")
+                self.log_box.see("end")
+
+    def browse_input(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Excel and CSV files", "*.xlsx *.csv")])
+        if file_path:
+            self.input_path.set(file_path)
+
+    def save_output(self):
+        file_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        if file_path:
+            self.output_path.set(file_path)
+
+    def cancel(self):
+        self.cancel_requested = True
+        self.log("Cancel requested by user.", "WARN")
+
+    def start_threaded_processing(self):
+        self.cancel_requested = False
+        input_file = self.input_path.get()
+        output_file = self.output_path.get()
+        if not input_file or not output_file:
+            messagebox.showerror("Missing File", "Please select both input and output files.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.dirname(output_file)
+        log_name = f"auditdata_parser_{timestamp}.log"
+        self.log_file = os.path.join(output_dir, log_name)
+
+        threading.Thread(target=self.process_file, args=(input_file, output_file), daemon=True).start()
+
+    def process_file(self, input_file, output_file):
+        start_time = datetime.now()
+        self.start_label.config(text=f"Start Time: {start_time.strftime('%H:%M:%S')}")
+        self.log(f"Started processing: {input_file}", "INFO")
+
+        if os.path.getsize(input_file) > 200 * 1024 * 1024:
+            self.log("⚠️ Warning: File is larger than 200MB. Processing may take time.", "WARN")
+
+        try:
+            phase_start = datetime.now()
+            self.update_phase("Hashing input file...")
+            self.overall_progress['value'] = 5
+            input_hash = self.compute_hash(input_file)
+            phase_end = datetime.now()
+            self.log(f"SHA256 (input): {input_hash}", "INFO")
+            self.log(f"Phase 'Hashing input file' duration: {(phase_end - phase_start).total_seconds():.2f} seconds", "INFO")
+            self.overall_progress['value'] = 10
+            if self.cancel_requested: return
+        except Exception as e:
+            self.log(f"Error during hashing: {e}", "ERROR")
+            messagebox.showerror("Error", f"Error during hashing: {e}")
+            return
+
+        try:
+            phase_start = datetime.now()
+            self.update_phase("Reading input file...")
+            ext = os.path.splitext(input_file)[-1].lower()
+            if ext == ".xlsx":
+                df = pd.read_excel(input_file)
+            elif ext == ".csv":
+                df = pd.read_csv(input_file)
             else:
-                parsed_data.append({})
+                raise ValueError("Unsupported file format. Use .xlsx or .csv")
+            phase_end = datetime.now()
+            self.log(f"Phase 'Reading input file' duration: {(phase_end - phase_start).total_seconds():.2f} seconds", "INFO")
+            self.overall_progress['value'] = 30
+            if self.cancel_requested: return
+        except Exception as e:
+            self.log(f"Error reading input file: {e}", "ERROR")
+            messagebox.showerror("Error", f"Error reading input file: {e}")
+            return
 
-            if idx % 100 == 0 or idx == total - 1:
-                parse_progress = int((idx + 1) / total * 65)
-                progress_fn(5 + parse_progress)
-                update_phase_progress(int((idx + 1) / total * 100))
+        try:
+            phase_start = datetime.now()
+            self.update_phase("Parsing AuditData column...")
+            parsed_data = []
+            json_errors = 0
+            total_rows = len(df)
+            audit_column = df["AuditData"].fillna("")
+            with multiprocessing.Pool() as pool:
+                for i, result in enumerate(pool.imap_unordered(safe_json_parse, audit_column), 1):
+                    if result is None:
+                        json_errors += 1
+                        parsed_data.append({})
+                    else:
+                        parsed_data.append(result)
+                    if self.cancel_requested:
+                        return
+            phase_end = datetime.now()
+            self.log(f"Phase 'Parsing AuditData column' duration: {(phase_end - phase_start).total_seconds():.2f} seconds", "INFO")
+            self.overall_progress['value'] = 70
+            if self.cancel_requested: return
+        except Exception as e:
+            self.log(f"Error parsing AuditData: {e}", "ERROR")
+            messagebox.showerror("Error", f"Error parsing AuditData: {e}")
+            return
 
-        current_task.set("Flattening JSON data...")
-        update_phase_progress(50)
-        log_fn("Flattening JSON and combining with original data...")
-        json_df = pd.json_normalize(parsed_data)
-        new_columns = json_df.columns.tolist()
-        df = df.drop(columns=['AuditData'])
-        df_combined = pd.concat([df, json_df], axis=1)
-        progress_fn(75)
+        try:
+            phase_start = datetime.now()
+            self.update_phase("Flattening and writing output...")
+            json_df = pd.json_normalize(parsed_data)
+            df_combined = pd.concat([df.drop(columns=["AuditData"]), json_df], axis=1)
+            df_combined.to_csv(output_file, index=False)
+            phase_end = datetime.now()
+            self.log(f"Phase 'Flattening and writing output' duration: {(phase_end - phase_start).total_seconds():.2f} seconds", "INFO")
+            self.overall_progress['value'] = 95
+        except Exception as e:
+            self.log(f"Error writing output file: {e}", "ERROR")
+            messagebox.showerror("Error", f"Error writing output file: {e}")
+            return
 
-        current_task.set("Writing Excel file...")
-        update_phase_progress(80)
-        log_fn(f"Writing Excel file to {output_path}...")
-        df_combined.to_excel(output_path, index=False)
-        progress_fn(85)
+        try:
+            output_hash = self.compute_hash(output_file)
+            self.log(f"SHA256 (output): {output_hash}", "INFO")
+        except Exception as e:
+            self.log(f"Error hashing output file: {e}", "ERROR")
 
-        current_task.set("Styling Excel headers...")
-        update_phase_progress(90)
-        log_fn("Styling new JSON headers...")
-        wb = load_workbook(output_path)
-        ws = wb.active
-        yellow_fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+        self.update_phase("Complete")
+        self.overall_progress['value'] = 100
 
-        for col_idx, cell in enumerate(ws[1], start=1):
-            if cell.value in new_columns:
-                ws.cell(row=1, column=col_idx).fill = yellow_fill
+        end_time = datetime.now()
+        duration = str(end_time - start_time).split(".")[0]
+        self.end_label.config(text=f"End Time: {end_time.strftime('%H:%M:%S')}")
+        self.duration_label.config(text=f"Duration: {duration}")
 
-        progress_fn(95)
-        wb.save(output_path)
+        summary_msg = f"Total Rows Processed: {total_rows} | JSON Errors: {json_errors}"
+        self.summary_label.config(text=summary_msg)
+        self.log(f"Finished: {output_file}", "DONE")
+        self.log(f"Started:  {start_time.strftime('%H:%M:%S')}", "INFO")
+        self.log(f"Ended:    {end_time.strftime('%H:%M:%S')}", "INFO")
+        self.log(f"Duration: {duration}", "INFO")
+        self.log(summary_msg, "INFO")
+        self.root.update_idletasks()
 
-        end_time = datetime.datetime.now()
-        duration = end_time - start_time
-        log_fn(f"🕔 Finish time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        log_fn(f"⏱ Duration: {str(duration)}")
-        finish_time_label.config(text=f"Finish: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        duration_label.config(text=f"Duration: {str(duration)}")
+    def compute_hash(self, filepath):
+        sha256 = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
 
-        current_task.set("Done.")
-        log_fn("✅ Export and styling complete!")
-        progress_fn(100)
-        update_phase_progress(100)
-        return output_path
+    def update_phase(self, text):
+        self.phase_label.config(text=f"Current Phase: {text}")
+        self.log(f"Current Phase: {text}", "INFO")
+        self.root.update_idletasks()
 
-    except Exception as e:
-        raise e
-
-# -------------------- Build GUI --------------------
-app = tk.Tk()
-app.title(f"AuditData Parser v{__version__}")
-app.geometry("600x580")
-app.resizable(False, False)
-
-input_file = tk.StringVar()
-output_file = tk.StringVar()
-log_file_path = tk.StringVar()
-cancel_flag = tk.BooleanVar(value=False)
-current_task = tk.StringVar(value="Idle")
-
-start_time_label = tk.Label(app, text="Start: --")
-finish_time_label = tk.Label(app, text="Finish: --")
-duration_label = tk.Label(app, text="Duration: --")
-
-# These will be placed at the bottom
-...
-
-start_time_label.pack()
-finish_time_label.pack()
-duration_label.pack()
-
-app.mainloop()
-
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    root = tk.Tk()
+    app = AuditDataParserApp(root)
+    root.mainloop()
